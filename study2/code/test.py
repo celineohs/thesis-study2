@@ -1,21 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-Study 2: 화면은 '게시물 + 익명 댓글 스레드', 내부는 **턴제 채팅**(익명 쪽 메시지 ↔ 참여자 메시지).
+Study 2: 게시물 + 익명 댓글 UI, 내부는 **2턴 채팅**(고정 익명 1 + LLM 익명 1 ↔ 참여자 2회).
 
-불변식(스레드 진행 중):
-  len(anon_turns) == len(user_turns) + 1
-종료:
-  len(user_turns) == TOTAL_THREAD_USER_TURNS (= 고정 1 + LLM 3)
+불변식(진행 중): len(anon_turns) == len(user_turns) + 1
+종료: len(user_turns) == 2 → 마지막 제출 후 JSON 저장 + Study1과 동일한 Google Drive 업로드
+
+Secrets: API_PROVIDER, ANTHROPIC_API_KEY, Study1과 동일 Drive 키(GOOGLE_DRIVE_FOLDER_ID 등)
 
 실행: streamlit run study2/code/test.py
-
-Secrets: API_PROVIDER, ANTHROPIC_API_KEY 등 (기존과 동일)
 """
 
 from __future__ import annotations
 
 import html
+import json
 import os
+import random
+import sys
+import time
+import uuid
+from datetime import datetime
 
 import streamlit as st
 
@@ -26,14 +30,24 @@ try:
 except ImportError:
     pass
 
-# --- 세션 키 (기존 배포와 호환: 이름 유지) ---
+# 같은 폴더의 gdrive_upload.py (Streamlit Cloud 배포 시 study2/code 전체 동봉)
+_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+if _CODE_DIR not in sys.path:
+    sys.path.insert(0, _CODE_DIR)
+from gdrive_upload import upload_file_to_drive  # noqa: E402
+
+# --- 세션 키 ---
 S_PAGE = "s2_page"
 S_POST_THOUGHT = "s2_post_thought"
-S_ANON = "s2_comment_contents"  # 익명 쪽 턴 메시지 (고정 첫 줄 + LLM)
-S_USER = "s2_comment_replies"  # 참여자 턴 메시지
+S_ANON = "s2_comment_contents"
+S_USER = "s2_comment_replies"
 S_ERR = "s2_last_error"
+S_SAVED = "s2_conversation_saved"
+S_GDRIVE_RESULT = "s2_gdrive_upload_result"
 
-# --- 상수 ---
+SAVE_PREFIX = "study2-thread"
+
+# --- 상수: 실제 상호작용 2턴 (고정 1 + LLM 1) ---
 FIRST_ANON_TEXT = (
     "이런 제도도 결국 본인이 움직일 의지가 있어야 의미가 있다고 봅니다. 일자리 정보, 상담, 훈련, 수당까지 지원해줘도 "
     "스스로 계획을 세우고 꾸준히 이행하지 않으면 상황은 달라지기 어렵습니다. 빈곤의 원인을 전부 사회 탓으로만 돌리기보다는, "
@@ -41,9 +55,13 @@ FIRST_ANON_TEXT = (
     "본인의 책임과 실행력이라고 생각합니다."
 )
 
-LLM_TURNS_AFTER_FIRST = 3
-# 참여자가 스레드에서 보내야 하는 메시지 수 (= 익명 말풍선 개수)
-TOTAL_THREAD_USER_TURNS = 1 + LLM_TURNS_AFTER_FIRST
+LLM_TURNS_AFTER_FIRST = 1
+TOTAL_THREAD_USER_TURNS = 1 + LLM_TURNS_AFTER_FIRST  # 2
+
+# 다음 익명 댓글 표시 전 지연: 사람이 비슷한 길이를 쓰는 시간을 가정 (글자수 기반 + 상한)
+TYPING_DELAY_BASE_SEC = 2.8
+TYPING_DELAY_PER_CHAR_SEC = 0.11
+TYPING_DELAY_MAX_SEC = 38.0
 
 POST_BODY = """
 국민취업지원제도는 저소득층이나 취업취약계층처럼 일자리를 찾는 과정에서 도움이 필요한 사람을 지원하는 공공 고용서비스다. 참여자는 고용센터나 위탁 운영기관에서 상담을 받고, 개인별 취업활동계획을 세운 뒤 직업훈련, 일경험, 구직활동 지원 등을 차례로 이용할 수 있다. 단순히 구직 등록만 하는 것이 아니라, 현재 상황을 확인하고 다음 활동을 함께 정하는 절차가 포함된다.
@@ -67,7 +85,6 @@ _AVATAR_BOX = """
 """
 
 
-# ========== 환경 / LLM (기존 유지) ==========
 def _get_env(key: str, default: str | None = None) -> str | None:
     try:
         if hasattr(st, "secrets") and st.secrets is not None:
@@ -122,8 +139,32 @@ def _api_provider() -> str:
     return (_get_env("API_PROVIDER") or "anthropic").lower()
 
 
+def _query_param_first(name: str) -> str | None:
+    try:
+        qp = st.query_params
+        if name not in qp:
+            return None
+        v = qp[name]
+        if isinstance(v, list):
+            return str(v[0]).strip() if v else None
+        return str(v).strip() if v else None
+    except Exception:
+        return None
+
+
+def _participant_id() -> str:
+    if st.session_state.get("s2_participant_id"):
+        return st.session_state.s2_participant_id
+    for key in ("participant", "pid", "PROLIFIC_PID", "subject"):
+        qv = _query_param_first(key)
+        if qv:
+            st.session_state.s2_participant_id = qv
+            return qv
+    st.session_state.s2_participant_id = f"s2_{uuid.uuid4().hex[:12]}"
+    return st.session_state.s2_participant_id
+
+
 def _build_llm_prompt(anon_turns: list[str], user_turns: list[str]) -> str:
-    """user_turns는 방금까지 제출된 참여자 메시지(직전 턴 포함). anon_turns[i] ↔ user_turns[i] 쌍."""
     lines: list[str] = [
         "다음은 연구용 게시물과, 그 아래에서 이어진 익명 댓글과 참여자 응답입니다.",
         "",
@@ -214,9 +255,64 @@ def _fetch_next_anon_message(anon: list[str], user: list[str]) -> str:
     return _call_llm(_build_llm_prompt(anon, user))
 
 
-# ========== 스레드(채팅) 불변식 ==========
+def _human_like_delay_before_show_comment(reply_text: str) -> None:
+    """LLM 결과를 받은 뒤, 사람이 비슷한 분량을 작성하는 것처럼 보이도록 표시 전만 지연."""
+    n = len(reply_text or "")
+    delay = TYPING_DELAY_BASE_SEC + n * TYPING_DELAY_PER_CHAR_SEC
+    delay = min(delay, TYPING_DELAY_MAX_SEC)
+    delay += random.uniform(-0.5, 0.8)
+    delay = max(1.8, delay)
+    placeholder = st.empty()
+    deadline = time.monotonic() + delay
+    while True:
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            break
+        placeholder.caption(f"다음 익명 댓글이 표시됩니다… (약 {max(1, int(remain + 0.99))}초)")
+        time.sleep(min(1.0, remain))
+    placeholder.empty()
+
+
+def _messages_for_export(anon: list[str], user: list[str]) -> list[dict]:
+    """assistant / user 순서 (Study1 messages 형식과 호환)."""
+    out: list[dict] = []
+    for i in range(len(anon)):
+        out.append({"role": "assistant", "content": anon[i]})
+        if i < len(user):
+            out.append({"role": "user", "content": user[i]})
+    return out
+
+
+def _save_conversation_to_disk_and_drive() -> str | None:
+    """마지막 참여자 제출 직후 1회: 로컬 JSON + Google Drive (Study1과 동일 upload_file_to_drive)."""
+    if st.session_state.get(S_SAVED):
+        return None
+    os.makedirs("conversations", exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pid = _participant_id()
+    path = f"conversations/{SAVE_PREFIX}_{pid}_{ts}.json"
+    anon = list(st.session_state[S_ANON])
+    user = list(st.session_state[S_USER])
+    data = {
+        "study": "study2",
+        "save_prefix": SAVE_PREFIX,
+        "participant_id": pid,
+        "saved_at": ts,
+        "post_thought": st.session_state.get(S_POST_THOUGHT) or "",
+        "anon_turns": anon,
+        "user_turns": user,
+        "messages": _messages_for_export(anon, user),
+        "total_user_turns": TOTAL_THREAD_USER_TURNS,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    ok, msg = upload_file_to_drive(path, _get_env)
+    st.session_state[S_GDRIVE_RESULT] = (ok, msg)
+    return path
+
+
+# ========== 스레드 불변식 ==========
 def _thread_invariant_ok(anon: list[str], user: list[str]) -> bool:
-    """진행 중: len(anon)==len(user)+1, 종료 직후: len(anon)==len(user)==TOTAL."""
     if len(anon) < 1:
         return False
     if len(user) > TOTAL_THREAD_USER_TURNS:
@@ -243,11 +339,9 @@ def _thread_complete(user: list[str]) -> bool:
 
 
 def _need_llm_after_user_message(user_count_after: int) -> bool:
-    """참여자가 한 턴 보낸 직후, 아직 LLM 익명 턴이 더 남았는지."""
     return user_count_after < TOTAL_THREAD_USER_TURNS
 
 
-# ========== 세션 ==========
 def _init_state() -> None:
     if S_PAGE not in st.session_state:
         st.session_state[S_PAGE] = "post"
@@ -259,6 +353,8 @@ def _init_state() -> None:
         st.session_state[S_USER] = []
     if S_ERR not in st.session_state:
         st.session_state[S_ERR] = None
+    if S_SAVED not in st.session_state:
+        st.session_state[S_SAVED] = False
 
 
 def _reset_all() -> None:
@@ -267,6 +363,10 @@ def _reset_all() -> None:
     st.session_state[S_ANON] = [FIRST_ANON_TEXT]
     st.session_state[S_USER] = []
     st.session_state[S_ERR] = None
+    st.session_state[S_SAVED] = False
+    st.session_state.pop(S_GDRIVE_RESULT, None)
+    if "s2_participant_id" in st.session_state:
+        del st.session_state.s2_participant_id
     for k in list(st.session_state.keys()):
         ks = str(k)
         if ks.startswith("s2_reply_active_") or ks.startswith("s2_thought_draft"):
@@ -324,7 +424,6 @@ def _render_anon_bubble(text: str) -> None:
 
 
 def _on_submit_current_turn(draft_key: str) -> None:
-    """참여자 턴 제출 → 불변식 유지하며 필요 시 LLM으로 다음 익명 턴 추가."""
     text = (st.session_state.get(draft_key) or "").strip()
     anon: list[str] = st.session_state[S_ANON]
     user: list[str] = st.session_state[S_USER]
@@ -333,6 +432,11 @@ def _on_submit_current_turn(draft_key: str) -> None:
     st.session_state[S_ERR] = None
 
     if _thread_complete(user):
+        try:
+            _save_conversation_to_disk_and_drive()
+            st.session_state[S_SAVED] = True
+        except Exception as e:
+            st.session_state[S_ERR] = f"저장/Drive 오류: {e}"
         st.rerun()
         return
 
@@ -341,11 +445,13 @@ def _on_submit_current_turn(draft_key: str) -> None:
         return
 
     try:
-        next_anon = _fetch_next_anon_message(anon, user)
+        with st.spinner("답글을 생성하는 중…"):
+            next_anon = _fetch_next_anon_message(anon, user)
         if _llm_output_is_error(next_anon):
             st.session_state[S_ERR] = next_anon or "댓글 생성에 실패했습니다. API 설정을 확인해 주세요."
             user.pop()
         else:
+            _human_like_delay_before_show_comment(next_anon)
             anon.append(next_anon)
     except Exception as e:
         st.session_state[S_ERR] = f"LLM 호출 오류: {e}"
@@ -389,14 +495,13 @@ def main() -> None:
             st.rerun()
         return
 
-    # --- 스레드: 익명 말풍선 i번 다음에 참여자 입력(또는 이미 제출된 내용) ---
     for i in range(len(anon)):
         st.markdown("---")
         _render_anon_bubble(anon[i])
 
         if i < len(user):
             st.text_area(
-                f"응답 (제출됨)",
+                "응답 (제출됨)",
                 value=user[i],
                 height=TEXTAREA_HEIGHT,
                 key=f"s2_reply_done_{i}",
@@ -422,6 +527,13 @@ def main() -> None:
 
     if _thread_complete(user):
         st.success("모든 응답이 완료되어 설문을 종료합니다. 참여해 주셔서 감사합니다.")
+        gd = st.session_state.get(S_GDRIVE_RESULT)
+        if gd:
+            ok, msg = gd
+            if ok:
+                st.info(msg)
+            else:
+                st.warning(msg)
         if st.button("처음부터 다시"):
             _reset_all()
             st.rerun()
