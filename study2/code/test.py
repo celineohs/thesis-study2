@@ -3,11 +3,12 @@
 Study 2: 게시물 → 생각 → 고정 첫 댓글 → 참여자 응답 기반 LLM 댓글 3턴 → 설문 종료.
 실행: streamlit run study2/code/test.py
 
-환경 변수(.env) 또는 Streamlit Community Cloud → 앱 설정 → Secrets (TOML):
-  API_PROVIDER = "anthropic"   # 생략 시 기본 anthropic(Claude)
-  ANTHROPIC_API_KEY = "..."
+환경 변수(.env) 또는 Streamlit Community Cloud → 앱 설정 → Secrets (TOML 예시):
+  API_PROVIDER = "anthropic"
+  ANTHROPIC_API_KEY = "sk-ant-..."
+  또는 소문자 키 anthropic_api_key = "..." 도 인식합니다.
   # 선택: ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
-OpenAI/Gemini 사용 시 API_PROVIDER 및 해당 *_API_KEY 를 설정.
+Secrets 값은 따옴표 없이 넣어도 되며, 저장 후 재실행이 필요할 수 있습니다.
 """
 
 from __future__ import annotations
@@ -26,15 +27,64 @@ except ImportError:
 
 
 def _get_env(key: str, default: str | None = None) -> str | None:
+    """Streamlit Secrets → 환경 변수 순으로 조회. 공백 제거."""
     try:
-        if hasattr(st, "secrets") and st.secrets is not None and key in st.secrets:
-            return st.secrets[key]
+        if hasattr(st, "secrets") and st.secrets is not None:
+            try:
+                if key in st.secrets:
+                    raw = st.secrets[key]
+                    if raw is not None and str(raw).strip():
+                        return str(raw).strip()
+            except Exception:
+                pass
     except Exception:
         pass
-    return os.getenv(key, default)
+    v = os.getenv(key)
+    if v is not None and str(v).strip():
+        return str(v).strip()
+    return default
 
 
-API_PROVIDER = (_get_env("API_PROVIDER") or "anthropic").lower()
+def _first_nonempty_env(*keys: str) -> str | None:
+    for k in keys:
+        v = _get_env(k)
+        if v:
+            return v
+    return None
+
+
+def _anthropic_api_key() -> str | None:
+    k = _first_nonempty_env(
+        "ANTHROPIC_API_KEY",
+        "anthropic_api_key",
+        "ANTHROPIC_KEY",
+    )
+    if k:
+        return k
+    try:
+        if hasattr(st, "secrets") and st.secrets is not None:
+            sec = st.secrets
+            sub = None
+            if hasattr(sec, "get"):
+                sub = sec.get("anthropic")
+            elif "anthropic" in sec:
+                sub = sec["anthropic"]
+            if sub is not None:
+                for inner_key in ("api_key", "ANTHROPIC_API_KEY", "apiKey"):
+                    val = None
+                    if isinstance(sub, dict):
+                        val = sub.get(inner_key)
+                    else:
+                        val = getattr(sub, inner_key, None)
+                    if val is not None and str(val).strip():
+                        return str(val).strip()
+    except Exception:
+        pass
+    return None
+
+
+def _api_provider() -> str:
+    return (_get_env("API_PROVIDER") or "anthropic").lower()
 
 # ----- 게시물 본문 -----
 POST_BODY = """
@@ -91,10 +141,16 @@ def _build_llm_user_prompt(contents: list[str], replies: list[str]) -> str:
 
 
 def _call_llm(user_prompt: str) -> str:
-    if API_PROVIDER == "openai":
+    provider = _api_provider()
+    if provider == "openai":
         from openai import OpenAI
 
-        client = OpenAI(api_key=_get_env("OPENAI_API_KEY") or "")
+        okey = _get_env("OPENAI_API_KEY")
+        if not okey:
+            return (
+                "OpenAI API 키가 없습니다. Secrets 또는 환경 변수 OPENAI_API_KEY를 설정하세요."
+            )
+        client = OpenAI(api_key=okey)
         resp = client.chat.completions.create(
             model=_get_env("OPENAI_MODEL") or "gpt-4o-mini",
             messages=[
@@ -106,10 +162,16 @@ def _call_llm(user_prompt: str) -> str:
         )
         text = (resp.choices[0].message.content or "").strip()
         return text
-    if API_PROVIDER == "anthropic":
+    if provider == "anthropic":
         import anthropic
 
-        client = anthropic.Anthropic(api_key=_get_env("ANTHROPIC_API_KEY") or "")
+        akey = _anthropic_api_key()
+        if not akey:
+            return (
+                "Anthropic API 키가 없습니다. Streamlit Secrets에 "
+                "ANTHROPIC_API_KEY = \"sk-ant-api03-...\" 형태로 추가했는지 확인하세요."
+            )
+        client = anthropic.Anthropic(api_key=akey)
         resp = client.messages.create(
             model=_get_env("ANTHROPIC_MODEL") or "claude-sonnet-4-20250514",
             max_tokens=600,
@@ -117,17 +179,20 @@ def _call_llm(user_prompt: str) -> str:
             messages=[{"role": "user", "content": user_prompt}],
         )
         return (resp.content[0].text or "").strip()
-    if API_PROVIDER == "gemini":
+    if provider == "gemini":
         import google.generativeai as genai
 
-        genai.configure(api_key=_get_env("GEMINI_API_KEY") or "")
+        gkey = _get_env("GEMINI_API_KEY")
+        if not gkey:
+            return "Gemini API 키가 없습니다. GEMINI_API_KEY를 설정하세요."
+        genai.configure(api_key=gkey)
         model = genai.GenerativeModel(
             model_name=_get_env("GEMINI_MODEL") or "gemini-2.0-flash",
             system_instruction=LLM_SYSTEM_PROMPT,
         )
         resp = model.generate_content(user_prompt)
         return (resp.text or "").strip()
-    return f"지원하지 않는 API_PROVIDER입니다: {API_PROVIDER}"
+    return f"지원하지 않는 API_PROVIDER입니다: {provider}"
 
 
 def _generate_next_llm_comment(contents: list[str], replies: list[str]) -> str:
@@ -251,11 +316,6 @@ def main() -> None:
             st.rerun()
 
     else:
-        st.caption(
-            "게시물에 대한 응답을 제출하셨습니다. 아래 댓글에 차례로 답해 주세요. "
-            f"(익명 댓글 {TOTAL_COMMENT_BLOCKS}개에 각각 응답하시면 설문이 종료됩니다.)"
-        )
-
         n_blocks = len(contents)
 
         for i in range(n_blocks):
@@ -294,11 +354,10 @@ def main() -> None:
                     # 아직 LLM 댓글 3개가 모두 나오지 않았으면 다음 댓글 생성
                     if n_rep < TOTAL_COMMENT_BLOCKS:
                         try:
-                            with st.spinner("익명 댓글을 생성하는 중입니다…"):
-                                next_c = _generate_next_llm_comment(
-                                    st.session_state.s2_comment_contents,
-                                    st.session_state.s2_comment_replies,
-                                )
+                            next_c = _generate_next_llm_comment(
+                                st.session_state.s2_comment_contents,
+                                st.session_state.s2_comment_replies,
+                            )
                             if not next_c or next_c.startswith("지원하지 않는"):
                                 st.session_state.s2_last_error = (
                                     next_c or "댓글 생성 결과가 비어 있습니다. API 설정을 확인해 주세요."
