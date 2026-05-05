@@ -171,14 +171,18 @@ def _call_llm(user_prompt: str) -> str:
                 "Anthropic API 키가 없습니다. Streamlit Secrets에 "
                 "ANTHROPIC_API_KEY = \"sk-ant-api03-...\" 형태로 추가했는지 확인하세요."
             )
-        client = anthropic.Anthropic(api_key=akey)
+        client = anthropic.Anthropic(api_key=akey, timeout=120.0)
         resp = client.messages.create(
             model=_get_env("ANTHROPIC_MODEL") or "claude-sonnet-4-20250514",
             max_tokens=600,
             system=LLM_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
         )
-        return (resp.content[0].text or "").strip()
+        parts: list[str] = []
+        for block in resp.content:
+            if getattr(block, "type", None) == "text":
+                parts.append(block.text)
+        return "".join(parts).strip()
     if provider == "gemini":
         import google.generativeai as genai
 
@@ -333,14 +337,16 @@ def main() -> None:
                 )
             elif i == len(replies):
                 draft_key = f"s2_reply_active_{i}"
-                st.text_area(
-                    f"댓글 {i + 1}에 대한 응답",
-                    height=TEXTAREA_HEIGHT,
-                    key=draft_key,
-                    placeholder="여기에 응답을 적어 주세요.",
-                    label_visibility="collapsed",
-                )
-                if st.button("응답 제출", type="primary", key=f"s2_submit_{i}"):
+                with st.form(key=f"s2_reply_form_{i}", clear_on_submit=False):
+                    st.text_area(
+                        f"댓글 {i + 1}에 대한 응답",
+                        height=TEXTAREA_HEIGHT,
+                        key=draft_key,
+                        placeholder="여기에 응답을 적어 주세요.",
+                        label_visibility="collapsed",
+                    )
+                    submitted = st.form_submit_button("응답 제출", type="primary")
+                if submitted:
                     text = (st.session_state.get(draft_key) or "").strip()
                     st.session_state.s2_comment_replies.append(text)
                     st.session_state.s2_last_error = None
@@ -358,7 +364,13 @@ def main() -> None:
                                 st.session_state.s2_comment_contents,
                                 st.session_state.s2_comment_replies,
                             )
-                            if not next_c or next_c.startswith("지원하지 않는"):
+                            _bad = (
+                                not next_c
+                                or next_c.startswith("지원하지 않는")
+                                or "API 키가 없습니다" in next_c
+                                or "API 키를 설정" in next_c
+                            )
+                            if _bad:
                                 st.session_state.s2_last_error = (
                                     next_c or "댓글 생성 결과가 비어 있습니다. API 설정을 확인해 주세요."
                                 )
