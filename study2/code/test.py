@@ -1,21 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-Study 2: 게시물 → 생각 → 고정 첫 댓글 → 참여자 응답 기반 LLM 댓글 3턴 → 설문 종료.
-실행: streamlit run study2/code/test.py
+Study 2: 게시물 + 익명 댓글 UI. 첫 익명 1 + AI(LLM) 익명 1을 연속으로 보여 준 뒤,
+참여자는 **AI 댓글에 대해 1회만** 응답하고 종료합니다.
 
-환경 변수(.env) 또는 Streamlit Community Cloud → 앱 설정 → Secrets (TOML):
-  API_PROVIDER = "anthropic"   # 생략 시 기본 anthropic(Claude)
-  ANTHROPIC_API_KEY = "..."
-  # 선택: ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
-OpenAI/Gemini 사용 시 API_PROVIDER 및 해당 *_API_KEY 를 설정.
+불변식: len(anon_turns) in {1, 2}, len(user_turns) <= 1, 완료 시 len(anon_turns)==2 and len(user_turns)==1
+종료: 마지막 제출 후 JSON 저장 + Study1과 동일한 Google Drive 업로드
+
+AI 댓글 아래: [AI 제안] 첫 단어(회색) + F2 단축키(회색 영역 클릭 후) 또는 버튼으로 입력란에 삽입.
+
+Secrets: API_PROVIDER, ANTHROPIC_API_KEY, Study1과 동일 Drive 키(GOOGLE_DRIVE_FOLDER_ID 등)
+
+실행: streamlit run study2/code/test.py
 """
 
 from __future__ import annotations
 
 import html
+import json
 import os
+import random
+import sys
+import time
+import uuid
+from datetime import datetime
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 try:
     from dotenv import load_dotenv
@@ -24,77 +34,190 @@ try:
 except ImportError:
     pass
 
+# 같은 폴더의 gdrive_upload.py (Streamlit Cloud 배포 시 study2/code 전체 동봉)
+_CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+if _CODE_DIR not in sys.path:
+    sys.path.insert(0, _CODE_DIR)
+from gdrive_upload import upload_file_to_drive  # noqa: E402
 
-def _get_env(key: str, default: str | None = None) -> str | None:
-    try:
-        if hasattr(st, "secrets") and st.secrets is not None and key in st.secrets:
-            return st.secrets[key]
-    except Exception:
-        pass
-    return os.getenv(key, default)
+_HOTKEY_FRONTEND = os.path.join(_CODE_DIR, "hotkey_f2_component", "frontend")
+_f2_accept_component = components.declare_component(
+    "s2_f2_accept",
+    path=os.path.abspath(_HOTKEY_FRONTEND),
+)
 
+# --- 세션 키 ---
+S_PAGE = "s2_page"
+S_POST_THOUGHT = "s2_post_thought"
+S_ANON = "s2_comment_contents"
+S_USER = "s2_comment_replies"
+S_ERR = "s2_last_error"
+S_SAVED = "s2_conversation_saved"
+S_GDRIVE_RESULT = "s2_gdrive_upload_result"
+S_F2_NONCE = "s2_f2_nonce"
 
-API_PROVIDER = (_get_env("API_PROVIDER") or "anthropic").lower()
+SAVE_PREFIX = "study2-thread"
+S2_REPLY_DRAFT_KEY = "s2_reply_final_draft"
 
-# ----- 게시물 본문 -----
-POST_BODY = """
-국민취업지원제도는 저소득층이나 취업취약계층처럼 일자리를 찾는 과정에서 도움이 필요한 사람을 지원하는 공공 고용서비스다. 참여자는 고용센터나 위탁 운영기관에서 상담을 받고, 개인별 취업활동계획을 세운 뒤 직업훈련, 일경험, 구직활동 지원 등을 차례로 이용할 수 있다. 단순히 구직 등록만 하는 것이 아니라, 현재 상황을 확인하고 다음 활동을 함께 정하는 절차가 포함된다.
-
-온라인에서는 고용24를 통해 제도 안내와 신청 절차, 구직신청, 훈련 과정, 운영기관 정보를 확인할 수 있다. 지원 내용은 참여 유형에 따라 달라지며, 일부에게는 구직촉진수당이나 취업활동비용도 지급된다. 다만 수당은 계획 수립과 실제 활동 이행 여부가 기준이 된다. 신청 전에는 소득·재산·취업경험 요건, 상담 일정, 활동 인정 기준과 제출 서류를 함께 살펴보는 것이 필요하다. 기관 안내에 따라 인정되는 활동이 다를 수 있어, 진행 중에는 상담 창구와 온라인 확인을 병행하는 편이 좋다.
-""".strip()
-
-# ----- 고정 첫 댓글 ([댓글] 말머리 없음) -----
-FIRST_COMMENT_FIXED = (
+# --- 상수: AI(LLM) 댓글 1개 본 뒤 참여자 1회 응답 ---
+FIRST_ANON_TEXT = (
     "이런 제도도 결국 본인이 움직일 의지가 있어야 의미가 있다고 봅니다. 일자리 정보, 상담, 훈련, 수당까지 지원해줘도 "
     "스스로 계획을 세우고 꾸준히 이행하지 않으면 상황은 달라지기 어렵습니다. 빈곤의 원인을 전부 사회 탓으로만 돌리기보다는, "
     "각자가 자신의 생활 태도와 구직 노력, 직업 역량을 돌아보는 계기로 삼아야 합니다. 지원은 필요하지만, 최종적으로 삶을 바꾸는 건 "
     "본인의 책임과 실행력이라고 생각합니다."
 )
 
-# LLM으로 추가되는 댓글 턴 수 (고정 첫 댓글 이후)
-LLM_REPLY_TURNS = 3
-# 총 댓글 개수 = 1 (고정) + 3 (LLM) = 4, 참여자 댓글 응답도 4회
-TOTAL_COMMENT_BLOCKS = 1 + LLM_REPLY_TURNS
+TOTAL_THREAD_USER_TURNS = 1
+
+# 다음 익명 댓글 표시 전 지연: 사람이 비슷한 길이를 쓰는 시간을 가정 (글자수 기반 + 상한)
+TYPING_DELAY_BASE_SEC = 2.8
+TYPING_DELAY_PER_CHAR_SEC = 0.11
+TYPING_DELAY_MAX_SEC = 38.0
+
+POST_BODY = """
+국민취업지원제도는 저소득층이나 취업취약계층처럼 일자리를 찾는 과정에서 도움이 필요한 사람을 지원하는 공공 고용서비스다. 참여자는 고용센터나 위탁 운영기관에서 상담을 받고, 개인별 취업활동계획을 세운 뒤 직업훈련, 일경험, 구직활동 지원 등을 차례로 이용할 수 있다. 단순히 구직 등록만 하는 것이 아니라, 현재 상황을 확인하고 다음 활동을 함께 정하는 절차가 포함된다.
+
+온라인에서는 고용24를 통해 제도 안내와 신청 절차, 구직신청, 훈련 과정, 운영기관 정보를 확인할 수 있다. 지원 내용은 참여 유형에 따라 달라지며, 일부에게는 구직촉진수당이나 취업활동비용도 지급된다. 다만 수당은 계획 수립과 실제 활동 이행 여부가 기준이 된다. 신청 전에는 소득·재산·취업경험 요건, 상담 일정, 활동 인정 기준과 제출 서류를 함께 살펴보는 것이 필요하다. 기관 안내에 따라 인정되는 활동이 다를 수 있어, 진행 중에는 상담 창구와 온라인 확인을 병행하는 편이 좋다.
+""".strip()
 
 LLM_SYSTEM_PROMPT = """당신은 온라인 게시물 아래에 다는 익명 댓글 작성자 역할을 합니다.
 
 [필수 지침]
 - 빈곤·경제적 어려움의 원인을 개인의 책임에 두는 관점에서 댓글을 작성합니다. 예: 개인적 절약·가계 관리 부족, 동기·자기 노력 부족, 능력 부족, 책임감·자기규율 부족, 개인 질환·신체적 제약, 학력·역량의 미흡 등을 전제로 한 논지.
-- 직전에 참여자가 작성한 응답을 읽고, 그에 맞춰 답하는 형식의 댓글을 작성합니다. 앞선 맥락이 주어지면 그 흐름을 유지합니다.
+- 직전 맥락(다른 익명 댓글, 필요 시 참여자가 게시물에 대해 적은 생각)을 읽고 그에 맞춰 이어지는 댓글을 작성합니다. 참여자가 아직 스레드에 글을 남기지 않은 경우라면, 첫 익명 댓글·게시물·참여자의 생각에 맞춰 자연스럽게 동조하거나 반박합니다.
 - 실제 온라인 커뮤니티 댓글처럼 자연스러운 한국어로, 2~6문장 정도로 작성합니다.
 - "[댓글]" 등 말머리, 번호 매기기, "익명:" 같은 접두는 넣지 마세요. 댓글 본문만 출력합니다.
 - 인용부호로 전체를 감싸지 마세요."""
 
+TEXTAREA_HEIGHT = 160
 
-def _build_llm_user_prompt(contents: list[str], replies: list[str]) -> str:
-    """contents와 replies 길이는 동일(참여자가 방금 제출한 직전 응답까지 반영)."""
+_AVATAR_BOX = """
+<div style="width:48px;height:48px;background:#202020;border-radius:8px;flex-shrink:0;"></div>
+"""
+
+
+def _get_env(key: str, default: str | None = None) -> str | None:
+    try:
+        if hasattr(st, "secrets") and st.secrets is not None:
+            try:
+                if key in st.secrets:
+                    raw = st.secrets[key]
+                    if raw is not None and str(raw).strip():
+                        return str(raw).strip()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    v = os.getenv(key)
+    if v is not None and str(v).strip():
+        return str(v).strip()
+    return default
+
+
+def _first_nonempty_env(*keys: str) -> str | None:
+    for k in keys:
+        v = _get_env(k)
+        if v:
+            return v
+    return None
+
+
+def _anthropic_api_key() -> str | None:
+    k = _first_nonempty_env(
+        "ANTHROPIC_API_KEY",
+        "anthropic_api_key",
+        "ANTHROPIC_KEY",
+    )
+    if k:
+        return k
+    try:
+        if hasattr(st, "secrets") and st.secrets is not None:
+            sec = st.secrets
+            sub = sec.get("anthropic") if hasattr(sec, "get") else None
+            if sub is None and "anthropic" in sec:
+                sub = sec["anthropic"]
+            if sub is not None:
+                for inner_key in ("api_key", "ANTHROPIC_API_KEY", "apiKey"):
+                    val = sub.get(inner_key) if isinstance(sub, dict) else getattr(sub, inner_key, None)
+                    if val is not None and str(val).strip():
+                        return str(val).strip()
+    except Exception:
+        pass
+    return None
+
+
+def _api_provider() -> str:
+    return (_get_env("API_PROVIDER") or "anthropic").lower()
+
+
+def _query_param_first(name: str) -> str | None:
+    try:
+        qp = st.query_params
+        if name not in qp:
+            return None
+        v = qp[name]
+        if isinstance(v, list):
+            return str(v[0]).strip() if v else None
+        return str(v).strip() if v else None
+    except Exception:
+        return None
+
+
+def _participant_id() -> str:
+    if st.session_state.get("s2_participant_id"):
+        return st.session_state.s2_participant_id
+    for key in ("participant", "pid", "PROLIFIC_PID", "subject"):
+        qv = _query_param_first(key)
+        if qv:
+            st.session_state.s2_participant_id = qv
+            return qv
+    st.session_state.s2_participant_id = f"s2_{uuid.uuid4().hex[:12]}"
+    return st.session_state.s2_participant_id
+
+
+def _build_llm_second_anon_prompt(first_anon: str, post_thought: str) -> str:
+    """참여자 스레드 응답 전: 첫 익명 댓글·게시물·(선택) 게시물에 대한 생각만으로 차기 익명 댓글 생성."""
     lines: list[str] = [
-        "다음은 연구용 게시물과, 그 아래에서 이어진 익명 댓글과 참여자 응답입니다.",
+        "다음은 연구용 게시물, 참여자가 게시물에 대해 먼저 작성한 생각(있을 수 있음), 그리고 게시물 아래 첫 익명 댓글입니다.",
         "",
         "[게시물]",
         POST_BODY,
         "",
-        "── 대화 내용 ──",
     ]
-    for i in range(len(replies)):
-        lines.append(f"익명 댓글 {i + 1}:")
-        lines.append(contents[i])
-        lines.append("")
-        lines.append("참여자 응답:")
-        lines.append(replies[i])
-        lines.append("")
-    lines.append(
-        "위 맥락에서, 참여자의 **가장 마지막 응답**에 직접 대답하는 형태의 새 익명 댓글만 작성하세요. "
-        "다른 설명 없이 댓글 본문만 출력합니다."
+    thought = (post_thought or "").strip()
+    if thought:
+        lines.extend(["[참여자가 게시물에 대해 작성한 생각]", thought, ""])
+    lines.extend(
+        [
+            "── 첫 익명 댓글 ──",
+            first_anon,
+            "",
+            "참여자는 아직 이 스레드(댓글 달기)에는 글을 남기지 않았습니다.",
+            "위 맥락에서, 첫 익명 댓글에 이어지는 **또 다른 익명 작성자의 차기 댓글**만 작성하세요. "
+            "게시물과 첫 댓글의 논지, 그리고 참여자가 게시물에 대해 적은 생각이 있다면 그것도 참고해 자연스럽게 이어가면 됩니다.",
+            "다른 설명 없이 댓글 본문만 출력합니다.",
+        ]
     )
     return "\n".join(lines)
 
 
+def _llm_output_is_error(text: str) -> bool:
+    if not text or text.startswith("지원하지 않는"):
+        return True
+    if "API 키가 없습니다" in text or "API 키를 설정" in text:
+        return True
+    return False
+
+
 def _call_llm(user_prompt: str) -> str:
-    if API_PROVIDER == "openai":
+    provider = _api_provider()
+    if provider == "openai":
         from openai import OpenAI
 
-        client = OpenAI(api_key=_get_env("OPENAI_API_KEY") or "")
+        okey = _get_env("OPENAI_API_KEY")
+        if not okey:
+            return "OpenAI API 키가 없습니다. Secrets 또는 환경 변수 OPENAI_API_KEY를 설정하세요."
+        client = OpenAI(api_key=okey)
         resp = client.chat.completions.create(
             model=_get_env("OPENAI_MODEL") or "gpt-4o-mini",
             messages=[
@@ -104,65 +227,154 @@ def _call_llm(user_prompt: str) -> str:
             temperature=0.75,
             max_tokens=600,
         )
-        text = (resp.choices[0].message.content or "").strip()
-        return text
-    if API_PROVIDER == "anthropic":
+        return (resp.choices[0].message.content or "").strip()
+    if provider == "anthropic":
         import anthropic
 
-        client = anthropic.Anthropic(api_key=_get_env("ANTHROPIC_API_KEY") or "")
+        akey = _anthropic_api_key()
+        if not akey:
+            return (
+                "Anthropic API 키가 없습니다. Streamlit Secrets에 "
+                'ANTHROPIC_API_KEY = "sk-ant-api03-..." 형태로 추가했는지 확인하세요.'
+            )
+        client = anthropic.Anthropic(api_key=akey, timeout=120.0)
         resp = client.messages.create(
             model=_get_env("ANTHROPIC_MODEL") or "claude-sonnet-4-20250514",
             max_tokens=600,
             system=LLM_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
         )
-        return (resp.content[0].text or "").strip()
-    if API_PROVIDER == "gemini":
+        parts: list[str] = []
+        for block in resp.content:
+            if getattr(block, "type", None) == "text":
+                parts.append(block.text)
+        return "".join(parts).strip()
+    if provider == "gemini":
         import google.generativeai as genai
 
-        genai.configure(api_key=_get_env("GEMINI_API_KEY") or "")
+        gkey = _get_env("GEMINI_API_KEY")
+        if not gkey:
+            return "Gemini API 키가 없습니다. GEMINI_API_KEY를 설정하세요."
+        genai.configure(api_key=gkey)
         model = genai.GenerativeModel(
             model_name=_get_env("GEMINI_MODEL") or "gemini-2.0-flash",
             system_instruction=LLM_SYSTEM_PROMPT,
         )
         resp = model.generate_content(user_prompt)
         return (resp.text or "").strip()
-    return f"지원하지 않는 API_PROVIDER입니다: {API_PROVIDER}"
+    return f"지원하지 않는 API_PROVIDER입니다: {provider}"
 
 
-def _generate_next_llm_comment(contents: list[str], replies: list[str]) -> str:
-    user_prompt = _build_llm_user_prompt(contents, replies)
-    return _call_llm(user_prompt)
+def _human_like_delay_before_show_comment(reply_text: str) -> None:
+    """LLM 결과를 받은 뒤, 사람이 비슷한 분량을 작성하는 것처럼 보이도록 표시 전만 지연."""
+    n = len(reply_text or "")
+    delay = TYPING_DELAY_BASE_SEC + n * TYPING_DELAY_PER_CHAR_SEC
+    delay = min(delay, TYPING_DELAY_MAX_SEC)
+    delay += random.uniform(-0.5, 0.8)
+    delay = max(1.8, delay)
+    placeholder = st.empty()
+    deadline = time.monotonic() + delay
+    while True:
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            break
+        placeholder.caption(f"다음 익명 댓글이 표시됩니다… (약 {max(1, int(remain + 0.99))}초)")
+        time.sleep(min(1.0, remain))
+    placeholder.empty()
 
 
-TEXTAREA_HEIGHT = 160
+def _messages_for_export(anon: list[str], user: list[str]) -> list[dict]:
+    """첫·AI 익명은 연속 assistant, 마지막에 참여자 1회 user."""
+    out: list[dict] = []
+    for a in anon:
+        out.append({"role": "assistant", "content": a})
+    for u in user:
+        out.append({"role": "user", "content": u})
+    return out
 
-_AVATAR_BOX = """
-<div style="width:48px;height:48px;background:#202020;border-radius:8px;flex-shrink:0;"></div>
-"""
+
+def _save_conversation_to_disk_and_drive() -> str | None:
+    """마지막 참여자 제출 직후 1회: 로컬 JSON + Google Drive (Study1과 동일 upload_file_to_drive)."""
+    if st.session_state.get(S_SAVED):
+        return None
+    os.makedirs("conversations", exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pid = _participant_id()
+    path = f"conversations/{SAVE_PREFIX}_{pid}_{ts}.json"
+    anon = list(st.session_state[S_ANON])
+    user = list(st.session_state[S_USER])
+    data = {
+        "study": "study2",
+        "save_prefix": SAVE_PREFIX,
+        "participant_id": pid,
+        "saved_at": ts,
+        "post_thought": st.session_state.get(S_POST_THOUGHT) or "",
+        "anon_turns": anon,
+        "user_turns": user,
+        "messages": _messages_for_export(anon, user),
+        "total_user_turns": TOTAL_THREAD_USER_TURNS,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    ok, msg = upload_file_to_drive(path, _get_env)
+    st.session_state[S_GDRIVE_RESULT] = (ok, msg)
+    return path
+
+
+# ========== 스레드 불변식 ==========
+def _thread_invariant_ok(anon: list[str], user: list[str]) -> bool:
+    if len(anon) not in (1, 2) or len(user) > 1:
+        return False
+    if len(anon) == 1:
+        return len(user) == 0
+    return len(user) <= 1
+
+
+def _repair_thread_if_broken() -> None:
+    anon: list[str] = st.session_state[S_ANON]
+    user: list[str] = st.session_state[S_USER]
+    if _thread_invariant_ok(anon, user):
+        return
+    st.session_state[S_ANON] = [FIRST_ANON_TEXT]
+    st.session_state[S_USER] = []
+    st.session_state[S_ERR] = None
+
+
+def _thread_complete(anon: list[str], user: list[str]) -> bool:
+    return len(anon) == 2 and len(user) >= TOTAL_THREAD_USER_TURNS
 
 
 def _init_state() -> None:
-    if "s2_page" not in st.session_state:
-        st.session_state.s2_page = "post"
-    if "s2_post_thought" not in st.session_state:
-        st.session_state.s2_post_thought = ""
-    if "s2_comment_contents" not in st.session_state:
-        st.session_state.s2_comment_contents = [FIRST_COMMENT_FIXED]
-    if "s2_comment_replies" not in st.session_state:
-        st.session_state.s2_comment_replies = []
-    if "s2_last_error" not in st.session_state:
-        st.session_state.s2_last_error = None
+    if S_PAGE not in st.session_state:
+        st.session_state[S_PAGE] = "post"
+    if S_POST_THOUGHT not in st.session_state:
+        st.session_state[S_POST_THOUGHT] = ""
+    if S_ANON not in st.session_state:
+        st.session_state[S_ANON] = [FIRST_ANON_TEXT]
+    if S_USER not in st.session_state:
+        st.session_state[S_USER] = []
+    if S_ERR not in st.session_state:
+        st.session_state[S_ERR] = None
+    if S_SAVED not in st.session_state:
+        st.session_state[S_SAVED] = False
+    if S_F2_NONCE not in st.session_state:
+        st.session_state[S_F2_NONCE] = 0
 
 
 def _reset_all() -> None:
-    st.session_state.s2_page = "post"
-    st.session_state.s2_post_thought = ""
-    st.session_state.s2_comment_contents = [FIRST_COMMENT_FIXED]
-    st.session_state.s2_comment_replies = []
-    st.session_state.s2_last_error = None
+    st.session_state[S_PAGE] = "post"
+    st.session_state[S_POST_THOUGHT] = ""
+    st.session_state[S_ANON] = [FIRST_ANON_TEXT]
+    st.session_state[S_USER] = []
+    st.session_state[S_ERR] = None
+    st.session_state[S_SAVED] = False
+    st.session_state.pop(S_GDRIVE_RESULT, None)
+    st.session_state[S_F2_NONCE] = 0
+    if "s2_participant_id" in st.session_state:
+        del st.session_state.s2_participant_id
     for k in list(st.session_state.keys()):
-        if str(k).startswith("s2_reply_active_") or str(k).startswith("s2_thought_draft"):
+        ks = str(k)
+        if ks.startswith("s2_reply_active_") or ks.startswith("s2_thought_draft") or ks == S2_REPLY_DRAFT_KEY:
             del st.session_state[k]
 
 
@@ -195,10 +407,70 @@ def _css() -> None:
             font-size: 1rem;
             line-height: 1.5;
         }
+        .s2-ai-suggest-line {
+            color: #888;
+            font-size: 0.95rem;
+            margin: 0.35rem 0 0.6rem 0;
+            padding-left: 60px;
+            line-height: 1.45;
+        }
+        .s2-ai-tag { color: #9a9a9a; font-weight: 600; }
         </style>
         """,
         unsafe_allow_html=True,
     )
+
+
+def _first_word_from_text(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+    return t.split()[0]
+
+
+def _apply_ai_first_word_to_draft(draft_key: str, ai_full_comment: str) -> None:
+    w = _first_word_from_text(ai_full_comment)
+    if not w:
+        return
+    cur = (st.session_state.get(draft_key) or "").strip()
+    if not cur:
+        st.session_state[draft_key] = w + " "
+        return
+    parts = cur.split()
+    if parts and parts[0] == w:
+        return
+    st.session_state[draft_key] = cur + " " + w
+
+
+def _f2_hotkey_component_ui(hint_text: str, draft_key: str, ai_comment: str) -> None:
+    nonce = int(st.session_state.get(S_F2_NONCE, 0))
+    val = _f2_accept_component(target_key="F2", hint_text=hint_text, key=f"s2f2_{nonce}")
+    if val == "accept":
+        _apply_ai_first_word_to_draft(draft_key, ai_comment)
+        st.session_state[S_F2_NONCE] = nonce + 1
+        st.rerun()
+
+
+def _ensure_second_anon_loaded() -> None:
+    """댓글 페이지 진입 시 첫 익명만 있으면 LLM으로 두 번째 익명 댓글을 채움."""
+    anon: list[str] = st.session_state[S_ANON]
+    if len(anon) >= 2:
+        return
+    if len(anon) != 1:
+        return
+    if st.session_state.get(S_ERR):
+        return
+    try:
+        with st.spinner("AI 에이전트의 익명 댓글을 준비하는 중…"):
+            prompt = _build_llm_second_anon_prompt(anon[0], st.session_state.get(S_POST_THOUGHT) or "")
+            next_anon = _call_llm(prompt)
+        if _llm_output_is_error(next_anon):
+            st.session_state[S_ERR] = next_anon or "댓글 생성에 실패했습니다. API 설정을 확인해 주세요."
+            return
+        _human_like_delay_before_show_comment(next_anon)
+        anon.append(next_anon)
+    except Exception as e:
+        st.session_state[S_ERR] = f"LLM 호출 오류: {e}"
 
 
 def _render_post() -> None:
@@ -207,13 +479,36 @@ def _render_post() -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-def _render_anonymous_block(comment_text: str) -> None:
-    safe = html.escape(comment_text)
+def _render_anon_bubble(text: str) -> None:
+    safe = html.escape(text)
     st.markdown(
         f'<div class="s2-anon-row">{_AVATAR_BOX}<p class="s2-anon-name">익명</p></div>'
         f'<div class="s2-comment-text">{safe}</div>',
         unsafe_allow_html=True,
     )
+
+
+def _on_submit_current_turn(draft_key: str) -> None:
+    text = (st.session_state.get(draft_key) or "").strip()
+    if not text:
+        st.session_state[S_ERR] = "응답을 한 글자 이상 입력해 주세요."
+        return
+    anon: list[str] = st.session_state[S_ANON]
+    user: list[str] = st.session_state[S_USER]
+
+    user.append(text)
+    st.session_state[S_ERR] = None
+
+    if _thread_complete(anon, user):
+        try:
+            _save_conversation_to_disk_and_drive()
+            st.session_state[S_SAVED] = True
+        except Exception as e:
+            st.session_state[S_ERR] = f"저장/Drive 오류: {e}"
+        st.rerun()
+        return
+
+    st.rerun()
 
 
 def main() -> None:
@@ -223,19 +518,16 @@ def main() -> None:
         layout="centered",
     )
     _init_state()
+    _repair_thread_if_broken()
     _css()
 
     st.title("Study 2 테스트")
-
     _render_post()
 
-    if st.session_state.s2_last_error:
-        st.error(st.session_state.s2_last_error)
+    if st.session_state[S_ERR]:
+        st.error(st.session_state[S_ERR])
 
-    contents = st.session_state.s2_comment_contents
-    replies = st.session_state.s2_comment_replies
-
-    if st.session_state.s2_page == "post":
+    if st.session_state[S_PAGE] == "post":
         st.subheader("이 게시물에 대해 어떻게 생각하시나요?")
         st.text_area(
             "게시물에 대한 생각",
@@ -245,80 +537,90 @@ def main() -> None:
             label_visibility="collapsed",
         )
         if st.button("다음", type="primary"):
-            st.session_state.s2_post_thought = st.session_state.get("s2_thought_draft", "")
-            st.session_state.s2_page = "comments"
-            st.session_state.s2_last_error = None
+            st.session_state[S_POST_THOUGHT] = st.session_state.get("s2_thought_draft", "")
+            st.session_state[S_PAGE] = "comments"
+            st.session_state[S_ERR] = None
             st.rerun()
+        return
 
-    else:
-        st.caption(
-            "게시물에 대한 응답을 제출하셨습니다. 아래 댓글에 차례로 답해 주세요. "
-            f"(익명 댓글 {TOTAL_COMMENT_BLOCKS}개에 각각 응답하시면 설문이 종료됩니다.)"
+    # --- 댓글 페이지: 두 번째 익명(AI)까지 로드 후, 그에 대한 응답 1회만 ---
+    _ensure_second_anon_loaded()
+    anon = st.session_state[S_ANON]
+    user = st.session_state[S_USER]
+
+    if len(anon) == 1 and st.session_state.get(S_ERR):
+        st.markdown("---")
+        _render_anon_bubble(anon[0])
+        if st.button("AI 댓글 다시 불러오기"):
+            st.session_state[S_ERR] = None
+            st.rerun()
+        return
+
+    if len(anon) < 2:
+        st.markdown("---")
+        _render_anon_bubble(anon[0])
+        st.caption("AI 에이전트의 익명 댓글을 준비하는 중입니다…")
+        return
+
+    st.markdown("---")
+    _render_anon_bubble(anon[0])
+    st.caption("첫 익명 댓글을 읽어 주세요. 이어서 AI 에이전트의 댓글이 표시됩니다.")
+
+    st.markdown("---")
+    _render_anon_bubble(anon[1])
+    ai_body = anon[1]
+    first_w = _first_word_from_text(ai_body)
+    if first_w:
+        fw = html.escape(first_w)
+        st.markdown(
+            f'<p class="s2-ai-suggest-line"><span class="s2-ai-tag">[AI 제안]</span> {fw}</p>',
+            unsafe_allow_html=True,
         )
 
-        n_blocks = len(contents)
-
-        for i in range(n_blocks):
-            st.markdown("---")
-            _render_anonymous_block(contents[i])
-
-            if i < len(replies):
-                st.text_area(
-                    f"댓글 {i + 1} 응답 (제출됨)",
-                    value=replies[i],
-                    height=TEXTAREA_HEIGHT,
-                    key=f"s2_reply_done_{i}",
-                    disabled=True,
-                    label_visibility="collapsed",
-                )
-            elif i == len(replies):
-                draft_key = f"s2_reply_active_{i}"
-                st.text_area(
-                    f"댓글 {i + 1}에 대한 응답",
-                    height=TEXTAREA_HEIGHT,
-                    key=draft_key,
-                    placeholder="여기에 응답을 적어 주세요.",
-                    label_visibility="collapsed",
-                )
-                if st.button("응답 제출", type="primary", key=f"s2_submit_{i}"):
-                    text = (st.session_state.get(draft_key) or "").strip()
-                    st.session_state.s2_comment_replies.append(text)
-                    st.session_state.s2_last_error = None
-
-                    n_rep = len(st.session_state.s2_comment_replies)
-                    # 4번째 응답까지 완료 시 LLM 추가 없이 종료
-                    if n_rep >= TOTAL_COMMENT_BLOCKS:
-                        st.rerun()
-                        break
-
-                    # 아직 LLM 댓글 3개가 모두 나오지 않았으면 다음 댓글 생성
-                    if n_rep < TOTAL_COMMENT_BLOCKS:
-                        try:
-                            with st.spinner("익명 댓글을 생성하는 중입니다…"):
-                                next_c = _generate_next_llm_comment(
-                                    st.session_state.s2_comment_contents,
-                                    st.session_state.s2_comment_replies,
-                                )
-                            if not next_c or next_c.startswith("지원하지 않는"):
-                                st.session_state.s2_last_error = (
-                                    next_c or "댓글 생성 결과가 비어 있습니다. API 설정을 확인해 주세요."
-                                )
-                                st.session_state.s2_comment_replies.pop()
-                            else:
-                                st.session_state.s2_comment_contents.append(next_c)
-                        except Exception as e:
-                            st.session_state.s2_last_error = f"LLM 호출 오류: {e}"
-                            st.session_state.s2_comment_replies.pop()
-                        st.rerun()
-                break
-            else:
-                break
-
-        if len(replies) >= TOTAL_COMMENT_BLOCKS:
-            st.success("모든 응답이 완료되어 설문을 종료합니다. 참여해 주셔서 감사합니다.")
-            if st.button("처음부터 다시"):
-                _reset_all()
+    draft_key = S2_REPLY_DRAFT_KEY
+    if len(user) >= 1:
+        st.text_area(
+            "응답 (제출됨)",
+            value=user[0],
+            height=TEXTAREA_HEIGHT,
+            key="s2_reply_done_final",
+            disabled=True,
+            label_visibility="collapsed",
+        )
+    else:
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            if st.button("첫 단어 넣기", type="secondary", help="AI 댓글 본문의 첫 단어를 응답란 끝에 추가합니다."):
+                _apply_ai_first_word_to_draft(draft_key, ai_body)
                 st.rerun()
+        with c2:
+            hint = f"[AI 제안] {first_w}" if first_w else "[AI 제안]"
+            _f2_hotkey_component_ui(hint, draft_key, ai_body)
+
+        with st.form(key="s2_final_form", clear_on_submit=False):
+            st.text_area(
+                "AI 익명 댓글에 대한 응답",
+                height=TEXTAREA_HEIGHT,
+                key=draft_key,
+                placeholder="여기에 응답을 적어 주세요.",
+                label_visibility="collapsed",
+            )
+            submitted = st.form_submit_button("응답 제출 (한 번만)", type="primary")
+        if submitted:
+            _on_submit_current_turn(draft_key)
+
+    if _thread_complete(anon, user):
+        st.success("응답이 완료되어 설문을 종료합니다. 참여해 주셔서 감사합니다.")
+        gd = st.session_state.get(S_GDRIVE_RESULT)
+        if gd:
+            ok, msg = gd
+            if ok:
+                st.info(msg)
+            else:
+                st.warning(msg)
+        if st.button("처음부터 다시"):
+            _reset_all()
+            st.rerun()
 
 
 if __name__ == "__main__":
