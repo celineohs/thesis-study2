@@ -42,6 +42,8 @@ S2_FIRST_AUTO_DONE = "s2_test2_first_autocomplete_done"
 S2_N_SUGG_REQUESTED = "s2_test2_n_suggestions_requested"
 S2_N_SUGG_ACCEPTED = "s2_test2_n_suggestions_accepted"
 S2_ERR = "s2_test2_err"
+# 위젯 key와 동일한 세션 키는 text_area 생성 이후 같은 런에서 직접 대입할 수 없음 → 병합은 다음 런 시작 시 적용
+S2_PENDING_MERGE = "s2_test2_pending_merge"
 
 
 def _query_param_first(name: str) -> str | None:
@@ -293,6 +295,7 @@ def _reset_session() -> None:
         S2_N_SUGG_REQUESTED,
         S2_N_SUGG_ACCEPTED,
         S2_ERR,
+        S2_PENDING_MERGE,
     ):
         st.session_state.pop(k, None)
     _init_session()
@@ -301,6 +304,12 @@ def _reset_session() -> None:
 def main() -> None:
     st.set_page_config(page_title="게시물 및 응답", page_icon="💬", layout="centered")
     _init_session()
+
+    pending = st.session_state.pop(S2_PENDING_MERGE, None)
+    if pending:
+        _merge_suggestion_into_draft(pending)
+        st.session_state[S2_N_SUGG_ACCEPTED] = int(st.session_state.get(S2_N_SUGG_ACCEPTED) or 0) + 1
+
     _css()
 
     dev = _dev_ui_enabled()
@@ -346,8 +355,7 @@ def main() -> None:
         if not s:
             st.warning("먼저 「이어 쓸 문장 받기」를 눌러 주세요.")
         else:
-            _merge_suggestion_into_draft(s)
-            st.session_state[S2_N_SUGG_ACCEPTED] = int(st.session_state[S2_N_SUGG_ACCEPTED]) + 1
+            st.session_state[S2_PENDING_MERGE] = s
             st.rerun()
 
     if st.session_state.get(S2_LAST_SUGG):
