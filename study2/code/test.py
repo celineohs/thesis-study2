@@ -6,7 +6,9 @@ Study 2: 게시물 + 익명 댓글 UI. 첫 익명 1 + AI(LLM) 익명 1을 연속
 불변식: len(anon_turns) in {1, 2}, len(user_turns) <= 1, 완료 시 len(anon_turns)==2 and len(user_turns)==1
 종료: 마지막 제출 후 JSON 저장 + Study1과 동일한 Google Drive 업로드
 
-AI 댓글 아래: [AI 제안] 첫 단어(회색) + F2 단축키(회색 영역 클릭 후) 또는 버튼으로 입력란에 삽입.
+게시물에 대한 생각·스레드 응답 작성 시: **자동완성 제안 받기**로 Claude 등 LLM이 문장·구절을 제안하고(입력란 아래 회색 표시), **입력란에 넣기**로 반영할 수 있습니다. (Streamlit `text_area` 한계로 IDE처럼 입력란 안에 겹쳐 보이는 고스트 텍스트는 네이티브로는 불가합니다.)
+
+자동완성 시스템 프롬프트: 개인적 책임 관점의 빈곤 서술에 기반한 제안.
 
 Secrets: API_PROVIDER, ANTHROPIC_API_KEY, Study1과 동일 Drive 키(GOOGLE_DRIVE_FOLDER_ID 등)
 
@@ -25,7 +27,6 @@ import uuid
 from datetime import datetime
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 try:
     from dotenv import load_dotenv
@@ -40,12 +41,6 @@ if _CODE_DIR not in sys.path:
     sys.path.insert(0, _CODE_DIR)
 from gdrive_upload import upload_file_to_drive  # noqa: E402
 
-_HOTKEY_FRONTEND = os.path.join(_CODE_DIR, "hotkey_f2_component", "frontend")
-_f2_accept_component = components.declare_component(
-    "s2_f2_accept",
-    path=os.path.abspath(_HOTKEY_FRONTEND),
-)
-
 # --- 세션 키 ---
 S_PAGE = "s2_page"
 S_POST_THOUGHT = "s2_post_thought"
@@ -54,7 +49,8 @@ S_USER = "s2_comment_replies"
 S_ERR = "s2_last_error"
 S_SAVED = "s2_conversation_saved"
 S_GDRIVE_RESULT = "s2_gdrive_upload_result"
-S_F2_NONCE = "s2_f2_nonce"
+S_AUTOCOMPLETE = "s2_reply_autocomplete_suggestion"
+S_POST_AUTOCOMPLETE = "s2_post_thought_autocomplete_suggestion"
 
 SAVE_PREFIX = "study2-thread"
 S2_REPLY_DRAFT_KEY = "s2_reply_final_draft"
@@ -88,6 +84,16 @@ LLM_SYSTEM_PROMPT = """당신은 온라인 게시물 아래에 다는 익명 댓
 - 실제 온라인 커뮤니티 댓글처럼 자연스러운 한국어로, 2~6문장 정도로 작성합니다.
 - "[댓글]" 등 말머리, 번호 매기기, "익명:" 같은 접두는 넣지 마세요. 댓글 본문만 출력합니다.
 - 인용부호로 전체를 감싸지 마세요."""
+
+AUTOCOMPLETE_SYSTEM_PROMPT = """당신은 효과적인 AI 지원 도구입니다. 빈곤은 개인적 책임 때문이라는 주장에 기반한 제안들을 제공하세요.
+
+[역할]
+- 참여자가 이미 입력한 글(있을 수 있음)에 이어 붙일 수 있는 **짧은 한국어 제안**을 합니다. 1~3문장 또는 자연스러운 한 구절 정도로, 너무 길지 않게 합니다.
+- 말투는 실제 댓글·게시물 반응처럼 자연스럽게 하되, 참여자 본인의 의견에 가깝게 씁니다.
+- 맥락(게시물, 익명 댓글 등 사용자 메시지에 주어진 내용)에 맞게 이어집니다. 제안 내용은 위 지침(개인적 책임 관점)과 일관되게 합니다.
+
+[출력 규칙]
+- 제안 문장만 출력합니다. 말머리, 따옴표로 전체 감싸기, 번호, "제안:" 같은 접두는 넣지 않습니다."""
 
 TEXTAREA_HEIGHT = 160
 
@@ -201,6 +207,56 @@ def _build_llm_second_anon_prompt(first_anon: str, post_thought: str) -> str:
     return "\n".join(lines)
 
 
+def _build_reply_autocomplete_prompt(
+    first_anon: str,
+    ai_comment: str,
+    draft_so_far: str,
+    post_thought: str,
+) -> str:
+    """AI 익명 댓글에 답하는 참여자 응답용 LLM 자동완성."""
+    lines: list[str] = [
+        "다음은 연구용 게시물, 게시물 아래 익명 댓글, 마지막 AI 익명 댓글, 참여자가 응답 칸에 지금까지 쓴 글입니다.",
+        "",
+        "[게시물]",
+        POST_BODY,
+        "",
+    ]
+    thought = (post_thought or "").strip()
+    if thought:
+        lines.extend(["[참여자가 게시물에 대해 먼저 적은 생각]", thought, ""])
+    lines.extend(
+        [
+            "[첫 익명 댓글]",
+            first_anon,
+            "",
+            "[마지막 AI 익명 댓글 — 참여자가 이에 답하는 중]",
+            ai_comment,
+            "",
+            "[참여자가 지금까지 응답 칸에 적은 글 (비어 있을 수 있음)]",
+            (draft_so_far.strip() if (draft_so_far or "").strip() else "(비어 있음)"),
+            "",
+            "위 맥락에서 참여자 응답을 이어서 쓸 **짧은 제안**만 출력하세요.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _build_post_thought_autocomplete_prompt(draft_so_far: str) -> str:
+    """게시물에 대한 생각 입력란용 LLM 자동완성."""
+    lines: list[str] = [
+        "다음은 연구용 게시물과, 참여자가 게시물에 대해 지금까지 입력한 글입니다.",
+        "",
+        "[게시물]",
+        POST_BODY,
+        "",
+        "[참여자가 지금까지 입력한 글 (비어 있을 수 있음)]",
+        (draft_so_far.strip() if (draft_so_far or "").strip() else "(비어 있음)"),
+        "",
+        "위 맥락에서 게시물에 대한 생각을 이어서 쓸 **짧은 제안**만 출력하세요.",
+    ]
+    return "\n".join(lines)
+
+
 def _llm_output_is_error(text: str) -> bool:
     if not text or text.startswith("지원하지 않는"):
         return True
@@ -209,7 +265,14 @@ def _llm_output_is_error(text: str) -> bool:
     return False
 
 
-def _call_llm(user_prompt: str) -> str:
+def _call_llm(
+    user_prompt: str,
+    *,
+    system: str | None = None,
+    max_tokens: int = 600,
+    temperature: float = 0.75,
+) -> str:
+    sys_text = LLM_SYSTEM_PROMPT if system is None else system
     provider = _api_provider()
     if provider == "openai":
         from openai import OpenAI
@@ -221,11 +284,11 @@ def _call_llm(user_prompt: str) -> str:
         resp = client.chat.completions.create(
             model=_get_env("OPENAI_MODEL") or "gpt-4o-mini",
             messages=[
-                {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                {"role": "system", "content": sys_text},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.75,
-            max_tokens=600,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
         return (resp.choices[0].message.content or "").strip()
     if provider == "anthropic":
@@ -240,8 +303,8 @@ def _call_llm(user_prompt: str) -> str:
         client = anthropic.Anthropic(api_key=akey, timeout=120.0)
         resp = client.messages.create(
             model=_get_env("ANTHROPIC_MODEL") or "claude-sonnet-4-20250514",
-            max_tokens=600,
-            system=LLM_SYSTEM_PROMPT,
+            max_tokens=max_tokens,
+            system=sys_text,
             messages=[{"role": "user", "content": user_prompt}],
         )
         parts: list[str] = []
@@ -258,9 +321,12 @@ def _call_llm(user_prompt: str) -> str:
         genai.configure(api_key=gkey)
         model = genai.GenerativeModel(
             model_name=_get_env("GEMINI_MODEL") or "gemini-2.0-flash",
-            system_instruction=LLM_SYSTEM_PROMPT,
+            system_instruction=sys_text,
         )
-        resp = model.generate_content(user_prompt)
+        resp = model.generate_content(
+            user_prompt,
+            generation_config={"temperature": temperature, "max_output_tokens": max_tokens},
+        )
         return (resp.text or "").strip()
     return f"지원하지 않는 API_PROVIDER입니다: {provider}"
 
@@ -313,6 +379,8 @@ def _save_conversation_to_disk_and_drive() -> str | None:
         "user_turns": user,
         "messages": _messages_for_export(anon, user),
         "total_user_turns": TOTAL_THREAD_USER_TURNS,
+        "llm_reply_autocomplete_last": (st.session_state.get(S_AUTOCOMPLETE) or "").strip(),
+        "llm_post_thought_autocomplete_last": (st.session_state.get(S_POST_AUTOCOMPLETE) or "").strip(),
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -338,6 +406,7 @@ def _repair_thread_if_broken() -> None:
     st.session_state[S_ANON] = [FIRST_ANON_TEXT]
     st.session_state[S_USER] = []
     st.session_state[S_ERR] = None
+    st.session_state[S_AUTOCOMPLETE] = ""
 
 
 def _thread_complete(anon: list[str], user: list[str]) -> bool:
@@ -357,8 +426,10 @@ def _init_state() -> None:
         st.session_state[S_ERR] = None
     if S_SAVED not in st.session_state:
         st.session_state[S_SAVED] = False
-    if S_F2_NONCE not in st.session_state:
-        st.session_state[S_F2_NONCE] = 0
+    if S_AUTOCOMPLETE not in st.session_state:
+        st.session_state[S_AUTOCOMPLETE] = ""
+    if S_POST_AUTOCOMPLETE not in st.session_state:
+        st.session_state[S_POST_AUTOCOMPLETE] = ""
 
 
 def _reset_all() -> None:
@@ -369,7 +440,8 @@ def _reset_all() -> None:
     st.session_state[S_ERR] = None
     st.session_state[S_SAVED] = False
     st.session_state.pop(S_GDRIVE_RESULT, None)
-    st.session_state[S_F2_NONCE] = 0
+    st.session_state[S_AUTOCOMPLETE] = ""
+    st.session_state[S_POST_AUTOCOMPLETE] = ""
     if "s2_participant_id" in st.session_state:
         del st.session_state.s2_participant_id
     for k in list(st.session_state.keys()):
@@ -407,48 +479,29 @@ def _css() -> None:
             font-size: 1rem;
             line-height: 1.5;
         }
-        .s2-ai-suggest-line {
+        .s2-autocomplete-line {
             color: #888;
             font-size: 0.95rem;
             margin: 0.35rem 0 0.6rem 0;
-            padding-left: 60px;
+            padding-left: 0;
             line-height: 1.45;
         }
-        .s2-ai-tag { color: #9a9a9a; font-weight: 600; }
+        .s2-autocomplete-tag { color: #9a9a9a; font-weight: 600; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def _first_word_from_text(text: str) -> str:
-    t = (text or "").strip()
-    if not t:
-        return ""
-    return t.split()[0]
-
-
-def _apply_ai_first_word_to_draft(draft_key: str, ai_full_comment: str) -> None:
-    w = _first_word_from_text(ai_full_comment)
-    if not w:
+def _merge_autocomplete_into_draft(draft_key: str, suggestion: str) -> None:
+    sug = (suggestion or "").strip()
+    if not sug:
         return
-    cur = (st.session_state.get(draft_key) or "").strip()
+    cur = (st.session_state.get(draft_key) or "").rstrip()
     if not cur:
-        st.session_state[draft_key] = w + " "
-        return
-    parts = cur.split()
-    if parts and parts[0] == w:
-        return
-    st.session_state[draft_key] = cur + " " + w
-
-
-def _f2_hotkey_component_ui(hint_text: str, draft_key: str, ai_comment: str) -> None:
-    nonce = int(st.session_state.get(S_F2_NONCE, 0))
-    val = _f2_accept_component(target_key="F2", hint_text=hint_text, key=f"s2f2_{nonce}")
-    if val == "accept":
-        _apply_ai_first_word_to_draft(draft_key, ai_comment)
-        st.session_state[S_F2_NONCE] = nonce + 1
-        st.rerun()
+        st.session_state[draft_key] = sug
+    else:
+        st.session_state[draft_key] = cur + " " + sug
 
 
 def _ensure_second_anon_loaded() -> None:
@@ -529,15 +582,60 @@ def main() -> None:
 
     if st.session_state[S_PAGE] == "post":
         st.subheader("이 게시물에 대해 어떻게 생각하시나요?")
+        thought_draft_key = "s2_thought_draft"
         st.text_area(
             "게시물에 대한 생각",
             height=TEXTAREA_HEIGHT,
-            key="s2_thought_draft",
-            placeholder="여기에 생각을 적어 주세요.",
+            key=thought_draft_key,
+            placeholder="여기에 생각을 적어 주세요. 필요하면 아래에서 자동완성 제안을 받을 수 있습니다.",
             label_visibility="collapsed",
         )
+        pcol, qcol = st.columns(2)
+        with pcol:
+            gen_post_ac = st.button(
+                "자동완성 제안 받기",
+                type="secondary",
+                key="s2_post_autocomplete_gen",
+                help="Claude 등 LLM이 위 입력란에 이어 쓸 문장·구절을 제안합니다.",
+            )
+        with qcol:
+            ins_post_ac = st.button(
+                "입력란에 넣기",
+                type="secondary",
+                key="s2_post_autocomplete_ins",
+                disabled=not (st.session_state.get(S_POST_AUTOCOMPLETE) or "").strip(),
+                help="회색으로 표시된 제안을 입력란 끝에 붙입니다.",
+            )
+        if gen_post_ac:
+            draft_preview = st.session_state.get(thought_draft_key) or ""
+            with st.spinner("자동완성 제안 생성 중…"):
+                prompt = _build_post_thought_autocomplete_prompt(draft_preview)
+                sugg = _call_llm(
+                    prompt,
+                    system=AUTOCOMPLETE_SYSTEM_PROMPT,
+                    max_tokens=280,
+                    temperature=0.65,
+                )
+            if _llm_output_is_error(sugg):
+                st.session_state[S_ERR] = sugg or "자동완성 제안을 만들지 못했습니다."
+            else:
+                st.session_state[S_ERR] = None
+                st.session_state[S_POST_AUTOCOMPLETE] = sugg.strip()
+            st.rerun()
+        if ins_post_ac:
+            _merge_autocomplete_into_draft(thought_draft_key, st.session_state.get(S_POST_AUTOCOMPLETE) or "")
+            st.rerun()
+
+        post_sugg = (st.session_state.get(S_POST_AUTOCOMPLETE) or "").strip()
+        if post_sugg:
+            safe_p = html.escape(post_sugg)
+            st.markdown(
+                f'<p class="s2-autocomplete-line"><span class="s2-autocomplete-tag">[자동완성 제안]</span> {safe_p}</p>',
+                unsafe_allow_html=True,
+            )
+
         if st.button("다음", type="primary"):
-            st.session_state[S_POST_THOUGHT] = st.session_state.get("s2_thought_draft", "")
+            st.session_state[S_POST_THOUGHT] = st.session_state.get(thought_draft_key, "")
             st.session_state[S_PAGE] = "comments"
             st.session_state[S_ERR] = None
             st.rerun()
@@ -569,13 +667,6 @@ def main() -> None:
     st.markdown("---")
     _render_anon_bubble(anon[1])
     ai_body = anon[1]
-    first_w = _first_word_from_text(ai_body)
-    if first_w:
-        fw = html.escape(first_w)
-        st.markdown(
-            f'<p class="s2-ai-suggest-line"><span class="s2-ai-tag">[AI 제안]</span> {fw}</p>',
-            unsafe_allow_html=True,
-        )
 
     draft_key = S2_REPLY_DRAFT_KEY
     if len(user) >= 1:
@@ -588,25 +679,63 @@ def main() -> None:
             label_visibility="collapsed",
         )
     else:
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            if st.button("첫 단어 넣기", type="secondary", help="AI 댓글 본문의 첫 단어를 응답란 끝에 추가합니다."):
-                _apply_ai_first_word_to_draft(draft_key, ai_body)
-                st.rerun()
-        with c2:
-            hint = f"[AI 제안] {first_w}" if first_w else "[AI 제안]"
-            _f2_hotkey_component_ui(hint, draft_key, ai_body)
-
-        with st.form(key="s2_final_form", clear_on_submit=False):
-            st.text_area(
-                "AI 익명 댓글에 대한 응답",
-                height=TEXTAREA_HEIGHT,
-                key=draft_key,
-                placeholder="여기에 응답을 적어 주세요.",
-                label_visibility="collapsed",
+        st.text_area(
+            "AI 익명 댓글에 대한 응답",
+            height=TEXTAREA_HEIGHT,
+            key=draft_key,
+            placeholder="여기에 응답을 적어 주세요. 필요하면 아래에서 자동완성 제안을 받을 수 있습니다.",
+            label_visibility="collapsed",
+        )
+        acol, bcol = st.columns(2)
+        with acol:
+            gen_ac = st.button(
+                "자동완성 제안 받기",
+                type="secondary",
+                key="s2_reply_autocomplete_gen",
+                help="Claude 등 LLM이 위 입력란에 이어 쓸 문장·구절을 제안합니다.",
             )
-            submitted = st.form_submit_button("응답 제출 (한 번만)", type="primary")
-        if submitted:
+        with bcol:
+            ins_ac = st.button(
+                "응답란에 넣기",
+                type="secondary",
+                key="s2_reply_autocomplete_ins",
+                disabled=not (st.session_state.get(S_AUTOCOMPLETE) or "").strip(),
+                help="회색으로 표시된 제안을 응답 입력란 끝에 붙입니다.",
+            )
+        if gen_ac:
+            draft_preview = st.session_state.get(draft_key) or ""
+            with st.spinner("응답 자동완성 제안 생성 중…"):
+                prompt = _build_reply_autocomplete_prompt(
+                    anon[0],
+                    ai_body,
+                    draft_preview,
+                    st.session_state.get(S_POST_THOUGHT) or "",
+                )
+                sugg = _call_llm(
+                    prompt,
+                    system=AUTOCOMPLETE_SYSTEM_PROMPT,
+                    max_tokens=280,
+                    temperature=0.65,
+                )
+            if _llm_output_is_error(sugg):
+                st.session_state[S_ERR] = sugg or "자동완성 제안을 만들지 못했습니다."
+            else:
+                st.session_state[S_ERR] = None
+                st.session_state[S_AUTOCOMPLETE] = sugg.strip()
+            st.rerun()
+        if ins_ac:
+            _merge_autocomplete_into_draft(draft_key, st.session_state.get(S_AUTOCOMPLETE) or "")
+            st.rerun()
+
+        sugg_show = (st.session_state.get(S_AUTOCOMPLETE) or "").strip()
+        if sugg_show:
+            safe_s = html.escape(sugg_show)
+            st.markdown(
+                f'<p class="s2-autocomplete-line"><span class="s2-autocomplete-tag">[자동완성 제안]</span> {safe_s}</p>',
+                unsafe_allow_html=True,
+            )
+
+        if st.button("응답 제출 (한 번만)", type="primary"):
             _on_submit_current_turn(draft_key)
 
     if _thread_complete(anon, user):
