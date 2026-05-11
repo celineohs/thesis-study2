@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Study 2 — Streamlit 옵션 2 프로토타입: 게시물 제시 + 응답 입력란에 AI 이어쓰기 제안.
+Study 2 — Streamlit 프로토타입: 게시물 + 응답란 이어쓰기(첫 방문 1회 자동, 이후 버튼).
 
-Streamlit 특성상 브라우저 타이핑마다 즉시 호출하는 UX는 제한적이라,
-(1) 첫 진입 시 1회 자동 제안, (2) 버튼으로 추가 제안 — 두 가지를 제공합니다.
+참여자 화면은 일반 웹 글쓰기에 가깝게 유지합니다. 연구자용 사이드바·JSON 저장은 URL에 `?dev=1`일 때만 표시됩니다.
 
-Secrets / 환경변수: API_PROVIDER(anthropic|openai|gemini), 해당 API 키, 선택 모델명.
+Secrets: API_PROVIDER(anthropic|openai|gemini), 해당 API 키, 선택 모델명.
 
 실행: streamlit run study2/code/test2.py
 """
@@ -15,7 +14,6 @@ from __future__ import annotations
 import html
 import json
 import os
-import sys
 from datetime import datetime
 
 import streamlit as st
@@ -33,8 +31,8 @@ POST_BODY = """
 온라인에서는 고용24를 통해 제도 안내와 신청 절차를 확인할 수 있다.
 """.strip()
 
-SUGGESTION_SYSTEM = """당신은 연구용 글쓰기 보조 도구입니다.
-사용자가 게시물에 대해 응답란에 쓴 글에 이어 붙일 수 있는 **짧은 한국어 제안**(1~3문장)만 출력합니다.
+SUGGESTION_SYSTEM = """당신은 글을 이어 쓰게 돕는 도우미입니다.
+사용자가 게시물에 대해 응답란에 쓴 글에 이어 붙일 수 있는 **짧은 한국어 문장**(1~3문장)만 출력합니다.
 출력에는 말머리, 따옴표로 전체 감싸기, 번호를 넣지 않습니다."""
 
 S2_DRAFT = "s2_test2_draft"
@@ -43,6 +41,23 @@ S2_FIRST_AUTO_DONE = "s2_test2_first_autocomplete_done"
 S2_N_SUGG_REQUESTED = "s2_test2_n_suggestions_requested"
 S2_N_SUGG_ACCEPTED = "s2_test2_n_suggestions_accepted"
 S2_ERR = "s2_test2_err"
+
+
+def _query_param_first(name: str) -> str | None:
+    try:
+        qp = st.query_params
+        if name not in qp:
+            return None
+        v = qp[name]
+        if isinstance(v, list):
+            return str(v[0]).strip() if v else None
+        return str(v).strip() if v else None
+    except Exception:
+        return None
+
+
+def _dev_ui_enabled() -> bool:
+    return (_query_param_first("dev") or "").lower() in ("1", "true", "yes")
 
 
 def _get_env(key: str, default: str | None = None) -> str | None:
@@ -211,10 +226,10 @@ def _request_suggestion() -> str | None:
         prompt = _build_user_prompt_for_suggestion(draft)
         out = _call_llm(prompt, system=SUGGESTION_SYSTEM)
     except Exception as e:
-        st.session_state[S2_ERR] = f"LLM 오류: {e}"
+        st.session_state[S2_ERR] = "문장을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."
         return None
     if _llm_output_is_error(out):
-        st.session_state[S2_ERR] = out or "제안 생성에 실패했습니다."
+        st.session_state[S2_ERR] = "문장을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."
         return None
     st.session_state[S2_ERR] = None
     st.session_state[S2_LAST_SUGG] = out.strip()
@@ -228,7 +243,7 @@ def _maybe_first_autocomplete(auto_on_load: bool) -> None:
     if not auto_on_load:
         return
     st.session_state[S2_FIRST_AUTO_DONE] = True
-    with st.spinner("첫 입력 제안을 불러오는 중…"):
+    with st.spinner("잠시만요…"):
         sugg = _request_suggestion()
     if sugg:
         _merge_suggestion_into_draft(sugg)
@@ -261,90 +276,94 @@ def _css() -> None:
             white-space: pre-wrap;
             margin-bottom: 1rem;
         }
+        footer { visibility: hidden; }
+        #MainMenu { visibility: hidden; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
+def _reset_session() -> None:
+    for k in (
+        S2_DRAFT,
+        S2_LAST_SUGG,
+        S2_FIRST_AUTO_DONE,
+        S2_N_SUGG_REQUESTED,
+        S2_N_SUGG_ACCEPTED,
+        S2_ERR,
+    ):
+        st.session_state.pop(k, None)
+    _init_session()
+
+
 def main() -> None:
-    st.set_page_config(page_title="Study 2 — 응답 + AI 제안", layout="centered")
+    st.set_page_config(page_title="게시물 및 응답", page_icon="💬", layout="centered")
     _init_session()
     _css()
 
-    st.sidebar.markdown("**API**")
-    st.sidebar.caption(f"provider: `{_api_provider()}`")
-    auto_on_load = st.sidebar.toggle("페이지 로드 시 첫 제안 자동 생성", value=True)
-    if st.sidebar.button("세션 초기화"):
-        for k in (
-            S2_DRAFT,
-            S2_LAST_SUGG,
-            S2_FIRST_AUTO_DONE,
-            S2_N_SUGG_REQUESTED,
-            S2_N_SUGG_ACCEPTED,
-            S2_ERR,
-        ):
-            st.session_state.pop(k, None)
-        _init_session()
-        st.rerun()
+    dev = _dev_ui_enabled()
+    auto_on_load = True
+    if dev:
+        st.sidebar.markdown("**연구자용** `?dev=1`")
+        st.sidebar.caption(f"provider: `{_api_provider()}`")
+        auto_on_load = st.sidebar.toggle("처음 들어올 때 문장 자동 붙이기", value=True)
+        if st.sidebar.button("이 화면 초기화"):
+            _reset_session()
+            st.rerun()
 
     st.markdown('<p class="t2-title">게시물</p>', unsafe_allow_html=True)
     st.markdown(f'<div class="t2-post">{html.escape(POST_BODY)}</div>', unsafe_allow_html=True)
 
-    st.subheader("응답")
+    st.subheader("응답을 적어 주세요")
     _maybe_first_autocomplete(auto_on_load)
 
     st.text_area(
         "응답 입력",
         height=200,
         key=S2_DRAFT,
-        placeholder="여기에 응답을 작성하세요. 자동 제안이 붙었을 수 있습니다.",
+        placeholder="편하게 작성해 주세요.",
         label_visibility="collapsed",
     )
 
     if st.session_state[S2_ERR]:
         st.error(st.session_state[S2_ERR])
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     with c1:
-        gen = st.button("AI 제안 생성", type="secondary")
+        gen = st.button("이어 쓸 문장 받기", type="secondary")
     with c2:
-        accept = st.button("마지막 제안을 끝에 붙이기", type="primary")
-    with c3:
-        save_json = st.button("로컬 JSON 저장")
+        accept = st.button("방금 문장 붙이기", type="primary")
 
     if gen:
-        with st.spinner("제안 생성 중…"):
+        with st.spinner("잠시만요…"):
             _request_suggestion()
         st.rerun()
 
     if accept:
         s = (st.session_state.get(S2_LAST_SUGG) or "").strip()
         if not s:
-            st.warning("먼저 「AI 제안 생성」으로 제안을 만드세요.")
+            st.warning("먼저 「이어 쓸 문장 받기」를 눌러 주세요.")
         else:
             _merge_suggestion_into_draft(s)
             st.session_state[S2_N_SUGG_ACCEPTED] = int(st.session_state[S2_N_SUGG_ACCEPTED]) + 1
             st.rerun()
 
     if st.session_state.get(S2_LAST_SUGG):
-        with st.expander("마지막 생성 제안 (미리보기)", expanded=False):
+        with st.expander("방금 받은 문장 보기", expanded=False):
             st.write(st.session_state[S2_LAST_SUGG])
 
-    if save_json:
-        os.makedirs("conversations", exist_ok=True)
-        path = os.path.join(
-            "conversations",
-            f"study2_test2_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-        )
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(_export_payload(), f, ensure_ascii=False, indent=2)
-        st.success(f"저장됨: `{path}`")
-
-    st.caption(
-        "요청 수·수락 수는 `n_suggestions_requested` / `n_suggestions_accepted`로 기록됩니다. "
-        "실험 조건(system 프롬프트)은 코드 상단 `SUGGESTION_SYSTEM`에서 바꾸면 됩니다."
-    )
+    if dev:
+        if st.button("로컬 JSON 저장"):
+            os.makedirs("conversations", exist_ok=True)
+            path = os.path.join(
+                "conversations",
+                f"study2_test2_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            )
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(_export_payload(), f, ensure_ascii=False, indent=2)
+            st.success(f"저장됨: `{path}`")
+        st.caption("연구자용: JSON 필드·프롬프트는 코드에서 설정합니다.")
 
 
 if __name__ == "__main__":

@@ -87,7 +87,7 @@ LLM_SYSTEM_PROMPT = """당신은 온라인 게시물 아래에 다는 익명 댓
 - "[댓글]" 등 말머리, 번호 매기기, "익명:" 같은 접두는 넣지 마세요. 댓글 본문만 출력합니다.
 - 인용부호로 전체를 감싸지 마세요."""
 
-AUTOCOMPLETE_SYSTEM_PROMPT = """당신은 효과적인 AI 지원 도구입니다. 빈곤은 개인적 책임 때문이라는 주장에 기반한 제안들을 제공하세요.
+AUTOCOMPLETE_SYSTEM_PROMPT = """당신은 글쓰기 맞춤 제안을 돕는 도우미입니다. 빈곤은 개인적 책임 때문이라는 주장에 기반한 제안들을 제공하세요.
 
 [역할]
 - 참여자가 이미 입력한 글(있을 수 있음)에 이어 붙일 수 있는 **짧은 한국어 제안**을 합니다. 1~3문장 또는 자연스러운 한 구절 정도로, 너무 길지 않게 합니다.
@@ -334,20 +334,27 @@ def _call_llm(
 
 
 def _human_like_delay_before_show_comment(reply_text: str) -> None:
-    """LLM 결과를 받은 뒤, 사람이 비슷한 분량을 작성하는 것처럼 보이도록 표시 전만 지연."""
+    """댓글이 이어져 붙는 간격을 두되, 참여자에게는 중립적인 안내로만 보이게 합니다."""
     n = len(reply_text or "")
     delay = TYPING_DELAY_BASE_SEC + n * TYPING_DELAY_PER_CHAR_SEC
     delay = min(delay, TYPING_DELAY_MAX_SEC)
     delay += random.uniform(-0.5, 0.8)
     delay = max(1.8, delay)
     placeholder = st.empty()
+    soft = [
+        "추가 댓글을 불러오는 중입니다.",
+        "댓글 목록을 정리하는 중입니다.",
+        "잠시만 기다려 주세요.",
+    ]
     deadline = time.monotonic() + delay
+    idx = 0
     while True:
         remain = deadline - time.monotonic()
         if remain <= 0:
             break
-        placeholder.caption(f"다음 익명 댓글이 표시됩니다… (약 {max(1, int(remain + 0.99))}초)")
-        time.sleep(min(1.0, remain))
+        placeholder.caption(soft[idx % len(soft)])
+        idx += 1
+        time.sleep(min(2.2, remain))
     placeholder.empty()
 
 
@@ -490,6 +497,8 @@ def _css() -> None:
             font-size: 1rem;
             line-height: 1.5;
         }
+        footer { visibility: hidden; }
+        #MainMenu { visibility: hidden; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -514,7 +523,7 @@ def _ensure_post_autofill(thought_draft_key: str) -> None:
     st.session_state[S2_POST_AUTOFILL_DONE] = True
     draft_preview = (st.session_state.get(thought_draft_key) or "").strip()
     try:
-        with st.spinner("입력 제안을 불러오는 중…"):
+        with st.spinner("잠시만요…"):
             prompt = _build_post_thought_autocomplete_prompt(draft_preview)
             sugg = _call_llm(
                 prompt,
@@ -523,11 +532,11 @@ def _ensure_post_autofill(thought_draft_key: str) -> None:
                 temperature=0.65,
             )
     except Exception as e:
-        st.session_state[S_ERR] = f"자동완성 오류: {e}"
+        st.session_state[S_ERR] = "입력을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."
         st.session_state[S_POST_AUTOCOMPLETE] = ""
         return
     if _llm_output_is_error(sugg):
-        st.session_state[S_ERR] = sugg or "자동완성 제안을 만들지 못했습니다."
+        st.session_state[S_ERR] = "입력을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."
         st.session_state[S_POST_AUTOCOMPLETE] = ""
         return
     st.session_state[S_ERR] = None
@@ -542,7 +551,7 @@ def _ensure_reply_autofill(draft_key: str, anon: list[str], ai_body: str) -> Non
     st.session_state[S2_REPLY_AUTOFILL_DONE] = True
     draft_preview = (st.session_state.get(draft_key) or "").strip()
     try:
-        with st.spinner("응답 입력 제안을 불러오는 중…"):
+        with st.spinner("잠시만요…"):
             prompt = _build_reply_autocomplete_prompt(
                 anon[0],
                 ai_body,
@@ -556,11 +565,11 @@ def _ensure_reply_autofill(draft_key: str, anon: list[str], ai_body: str) -> Non
                 temperature=0.65,
             )
     except Exception as e:
-        st.session_state[S_ERR] = f"자동완성 오류: {e}"
+        st.session_state[S_ERR] = "입력을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."
         st.session_state[S_AUTOCOMPLETE] = ""
         return
     if _llm_output_is_error(sugg):
-        st.session_state[S_ERR] = sugg or "자동완성 제안을 만들지 못했습니다."
+        st.session_state[S_ERR] = "입력을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."
         st.session_state[S_AUTOCOMPLETE] = ""
         return
     st.session_state[S_ERR] = None
@@ -578,23 +587,23 @@ def _ensure_second_anon_loaded() -> None:
     if st.session_state.get(S_ERR):
         return
     try:
-        with st.spinner("AI 에이전트의 익명 댓글을 준비하는 중…"):
+        with st.spinner("댓글을 불러오는 중…"):
             prompt = _build_llm_second_anon_prompt(anon[0], st.session_state.get(S_POST_THOUGHT) or "")
             next_anon = _call_llm(prompt)
         if _llm_output_is_error(next_anon):
-            st.session_state[S_ERR] = next_anon or "댓글 생성에 실패했습니다. API 설정을 확인해 주세요."
+            st.session_state[S_ERR] = "댓글을 불러오지 못했습니다. 아래에서 다시 시도해 주세요."
             return
         _human_like_delay_before_show_comment(next_anon)
         anon.append(next_anon)
     except Exception as e:
-        st.session_state[S_ERR] = f"LLM 호출 오류: {e}"
+        st.session_state[S_ERR] = "댓글을 불러오지 못했습니다. 잠시 후 다시 시도해 주세요."
 
 
 def _render_title_and_post() -> None:
     """제목과 게시물 본문을 한 번에 렌더해 사이 여백을 줄입니다."""
     body = html.escape(POST_BODY)
     st.markdown(
-        f'<h1 class="s2-page-title">Study 2 테스트</h1>'
+        f'<h1 class="s2-page-title">게시물</h1>'
         f'<div class="s2-post-box" style="white-space:pre-wrap;">{body}</div>',
         unsafe_allow_html=True,
     )
@@ -625,7 +634,7 @@ def _on_submit_current_turn(draft_key: str) -> None:
             _save_conversation_to_disk_and_drive()
             st.session_state[S_SAVED] = True
         except Exception as e:
-            st.session_state[S_ERR] = f"저장/Drive 오류: {e}"
+            st.session_state[S_ERR] = "제출 저장 중 문제가 발생했습니다. 잠시 후 다시 시도해 주세요."
         st.rerun()
         return
 
@@ -634,8 +643,8 @@ def _on_submit_current_turn(draft_key: str) -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="Study 2 테스트 플랫폼",
-        page_icon="📝",
+        page_title="게시물 및 댓글",
+        page_icon="💬",
         layout="centered",
     )
     _init_state()
@@ -653,17 +662,17 @@ def main() -> None:
         st.error(st.session_state[S_ERR])
 
     if st.session_state[S_PAGE] == "post":
-        st.subheader("이 게시물에 대해 어떻게 생각하시나요?")
+        st.subheader("이 글에 대해 어떻게 생각하시나요?")
         thought_draft_key = "s2_thought_draft"
         st.text_area(
             "게시물에 대한 생각",
             height=TEXTAREA_HEIGHT,
             key=thought_draft_key,
-            placeholder="여기에 생각을 적어 주세요. 위 내용에 자동 제안이 붙었을 수 있습니다.",
+            placeholder="편하게 작성해 주세요.",
             label_visibility="collapsed",
         )
 
-        if st.button("다음", type="primary"):
+        if st.button("댓글 보기", type="primary"):
             st.session_state[S_POST_THOUGHT] = st.session_state.get(thought_draft_key, "")
             st.session_state[S_PAGE] = "comments"
             st.session_state[S_ERR] = None
@@ -677,7 +686,7 @@ def main() -> None:
     if len(anon) == 1 and st.session_state.get(S_ERR):
         st.markdown("---")
         _render_anon_bubble(anon[0])
-        if st.button("AI 댓글 다시 불러오기"):
+        if st.button("다시 불러오기"):
             st.session_state[S_ERR] = None
             st.rerun()
         return
@@ -685,12 +694,12 @@ def main() -> None:
     if len(anon) < 2:
         st.markdown("---")
         _render_anon_bubble(anon[0])
-        st.caption("AI 에이전트의 익명 댓글을 준비하는 중입니다…")
+        st.caption("추가 댓글을 불러오는 중입니다.")
         return
 
     st.markdown("---")
     _render_anon_bubble(anon[0])
-    st.caption("첫 익명 댓글을 읽어 주세요. 이어서 AI 에이전트의 댓글이 표시됩니다.")
+    st.caption("아래 댓글을 읽어 주세요.")
 
     st.markdown("---")
     _render_anon_bubble(anon[1])
@@ -699,7 +708,7 @@ def main() -> None:
     draft_key = S2_REPLY_DRAFT_KEY
     if len(user) >= 1:
         st.text_area(
-            "응답 (제출됨)",
+            "작성한 내용",
             value=user[0],
             height=TEXTAREA_HEIGHT,
             key="s2_reply_done_final",
@@ -711,26 +720,26 @@ def main() -> None:
         if st.session_state[S_ERR]:
             st.error(st.session_state[S_ERR])
         st.text_area(
-            "AI 익명 댓글에 대한 응답",
+            "댓글 작성",
             height=TEXTAREA_HEIGHT,
             key=draft_key,
-            placeholder="여기에 응답을 적어 주세요. 위 내용에 자동 제안이 붙었을 수 있습니다.",
+            placeholder="읽은 내용에 대해 편하게 남겨 주세요.",
             label_visibility="collapsed",
         )
 
-        if st.button("응답 제출 (한 번만)", type="primary"):
+        if st.button("제출하기", type="primary"):
             _on_submit_current_turn(draft_key)
 
     if _thread_complete(anon, user):
-        st.success("응답이 완료되어 설문을 종료합니다. 참여해 주셔서 감사합니다.")
+        st.success("제출되었습니다. 참여해 주셔서 감사합니다.")
         gd = st.session_state.get(S_GDRIVE_RESULT)
         if gd:
-            ok, msg = gd
+            ok, _msg = gd
             if ok:
-                st.info(msg)
+                st.caption("기록이 정상적으로 반영되었습니다.")
             else:
-                st.warning(msg)
-        if st.button("처음부터 다시"):
+                st.caption("기록 반영에 문제가 있을 수 있습니다. 연구 담당자에게 문의해 주세요.")
+        if st.button("처음부터"):
             _reset_all()
             st.rerun()
 
